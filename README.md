@@ -1,8 +1,5 @@
 # 代码整合版（`代码整合版.py`）使用说明
 
-本目录把多个分散的可视化、打标后数据分析、LDA 主题建模与趋势预测脚本整合为**一个可运行的单文件命令行程序**：`代码整合版.py`。
-
----
 
 ## 快速开始
 
@@ -17,6 +14,16 @@ python "代码整合版.py" --help
 ```bash
 python "代码整合版.py" viz10
 python "代码整合版.py" trend
+```
+
+端到端一键跑完（抽取合并→打标签→可视化→预测）：
+
+```bash
+export OPENAI_API_KEY="你的key"
+# 可选：export OPENAI_BASE_URL="你的 OpenAI 兼容网关"
+# 可选：export OPENAI_MODEL="deepseek-chat"
+
+python "代码整合版.py" pipeline --month 12 --project-dir .
 ```
 
 ---
@@ -49,7 +56,17 @@ python -m pip install tensorflow keras
 
 ---
 
-## 数据目录约定（“开箱即跑”）
+## 环境变量（LLM / pipeline）
+
+`pipeline` 会调用 LLM 完成抽取、合并摘要/标题、以及打标签。你需要提供以下环境变量（或用命令行参数传入）：
+
+- `OPENAI_API_KEY`：必填（也可用 `--api-key` 传入）
+- `OPENAI_BASE_URL`：可选（也可用 `--base-url` 传入）
+- `OPENAI_MODEL`：可选（也可用 `--model` 传入）
+
+---
+
+## 数据目录
 
 `代码整合版.py` 会自动探测默认数据路径；你也可以随时用参数覆盖。
 
@@ -88,6 +105,12 @@ python -m pip install tensorflow keras
 - `./dataset/new_analysis`
 - `./new_analysis`
 - `./data_2025_full/new_analysis`
+
+### 端到端流水线（`pipeline`）
+
+默认读取项目目录下的原始新闻数据：
+
+- `./data_2025_full/news/news_2025_{month}.xlsx`（month 取 10/11/12）
 
 ---
 
@@ -206,6 +229,33 @@ python "代码整合版.py" trend --data-dir "/你的/new_analysis目录" --outp
 
 ---
 
+### `pipeline`：端到端（抽取合并→打标签→可视化→预测）
+
+```bash
+python "代码整合版.py" pipeline --month 12 --project-dir .
+```
+
+参数：
+
+- `--api-key/--base-url/--model`：LLM 配置（也可用环境变量）
+- `--output-dir`：输出目录（默认 `project_dir/pipeline_out_{month}`）
+- `--no-viz`：不运行 step6（可视化）
+- `--no-forecast`：不运行 step7（预测）
+
+流程（已在代码里显式标注 step1..step7）：
+
+- **step1**：新闻案件信息抽取 → `news_2025_{month}_extracted.xlsx`
+- **step2**：按 `case_key` 聚类合并案件 → `scam_cases_final_2025_{month}.xlsx`
+- **step3**：Scam types 打标（primary/secondary + scam_process）→ `news_scam_types.xlsx`
+- **step4**：Scam tactics 打标（tactic_categories）→ `news_tactic_categories_ai.xlsx`
+- **step5**：script_pattern 抽取（3–6步流程）→ `news_with_scripts.xlsx`
+- **step6**：pipeline 专用可视化（不依赖旧脚本命名）→ `pipeline_step6_*.png`
+- **step7**：pipeline 专用预测（基于 publish_time 构建日序列，ARIMA；可选 LSTM）→ `pipeline_step7_*.png` + `pipeline_step7_results.txt`
+
+输出目录（默认）：`./pipeline_out_{month}/`
+
+---
+
 ## 常见问题
 
 ### 1) 报错提示缺少 Excel 文件
@@ -226,5 +276,14 @@ python -m pip install kaleido
 
 ```bash
 python -m pip install tensorflow keras
+```
+
+### 4) `pipeline` 提示未提供 API key
+
+设置环境变量后重跑：
+
+```bash
+export OPENAI_API_KEY="你的key"
+python "代码整合版.py" pipeline --month 12 --project-dir .
 ```
 

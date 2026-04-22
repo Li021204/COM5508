@@ -86,6 +86,46 @@ def _require_path_exists(path: str, what: str = "路径") -> None:
         raise FileNotFoundError(f"{what}不存在：{path}")
 
 
+def _get_env(name: str) -> Optional[str]:
+    v = os.environ.get(name)
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def _get_openai_client(api_key: Optional[str], base_url: Optional[str]):
+    """
+    OpenAI-compatible client factory.
+    - api_key: if None, will read env OPENAI_API_KEY
+    - base_url: if None, will read env OPENAI_BASE_URL (optional)
+    """
+    try:
+        from openai import OpenAI  # type: ignore[import-not-found]
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "缺少依赖 openai。请先安装：python -m pip install openai"
+        ) from e
+
+    key = api_key or _get_env("OPENAI_API_KEY")
+    if not key:
+        raise ValueError("未提供 API key。请设置环境变量 OPENAI_API_KEY，或在命令行参数中传入。")
+    url = base_url or _get_env("OPENAI_BASE_URL")
+    kwargs = {"api_key": key}
+    if url:
+        kwargs["base_url"] = url
+    return OpenAI(**kwargs)
+
+
+def _clean_json_maybe(text: str):
+    import json
+
+    try:
+        if "```" in text:
+            text = text.split("```")[1]
+            text = text.replace("json", "").strip()
+        return json.loads(text)
+    except Exception:
+        return None
+
+
 def _require_files(base_path: str, required_files: Iterable[str], *, what: str) -> None:
     missing = [f for f in required_files if not os.path.exists(os.path.join(base_path, f))]
     if missing:
@@ -113,6 +153,794 @@ def _require_any_files(base_path: str, candidates: Iterable[str], *, what: str) 
         " - 把数据文件放到上面的 data_dir；或\n"
         " - 运行时用 --data-dir 指向你真实的数据文件夹。"
     )
+
+
+def _parse_json_list_maybe(x) -> list:
+    """
+    兼容：
+    - python list
+    - JSON string / python list string
+    - 空值
+    """
+    import json
+    import ast
+
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return []
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                v = json.loads(s)
+                return v if isinstance(v, list) else []
+            except Exception:
+                try:
+                    v = ast.literal_eval(s)
+                    return v if isinstance(v, list) else []
+                except Exception:
+                    return []
+        return []
+    return []
+
+
+def _pipeline_viz(*, types_xlsx: str, tactics_xlsx: str, scripts_xlsx: str, output_dir: str) -> None:
+    """
+    pipeline 专用可视化（不依赖 10/11/12 月旧脚本的文件命名）。
+    输出到 output_dir。
+    """
+    _set_cn_font_for_matplotlib()
+
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns  # type: ignore[import-not-found]
+
+    df_types = pd.read_excel(types_xlsx) if os.path.exists(types_xlsx) else pd.DataFrame()
+    df_tactics = pd.read_excel(tactics_xlsx) if os.path.exists(tactics_xlsx) else pd.DataFrame()
+    df_scripts = pd.read_excel(scripts_xlsx) if os.path.exists(scripts_xlsx) else pd.DataFrame()
+
+    # step6-1: 主诈骗类型分布
+    if not df_types.empty and "primary_type" in df_types.columns:
+        plt.figure(figsize=(10, 5))
+        vc = df_types["primary_type"].fillna("Unknown").astype(str).value_counts().head(15)
+        sns.barplot(x=vc.values, y=vc.index, palette="Blues_r")
+        plt.title("Pipeline: Primary Scam Type Distribution", fontsize=14)
+        plt.xlabel("Count")
+        plt.ylabel("Primary Type")
+        plt.tight_layout()
+        out = os.path.join(output_dir, "pipeline_step6_1_primary_type_distribution.png")
+        plt.savefig(out, dpi=200, bbox_inches="tight")
+        plt.close()
+
+    # step6-2: tactic_categories 热力图（类别 × 诈骗类型）
+    if (not df_tactics.empty) and ("tactic_categories" in df_tactics.columns) and ("primary_type" in df_tactics.columns):
+        tmp = df_tactics[["primary_type", "tactic_categories"]].copy()
+        tmp["primary_type"] = tmp["primary_type"].fillna("Unknown").astype(str)
+        tmp["tactic_categories_list"] = tmp["tactic_categories"].apply(_parse_json_list_maybe)
+        tmp = tmp.explode("tactic_categories_list")
+        tmp["tactic_categories_list"] = tmp["tactic_categories_list"].fillna("Unknown").astype(str)
+        pivot = pd.crosstab(tmp["tactic_categories_list"], tmp["primary_type"])
+        pivot = pivot.loc[pivot.sum(axis=1) > 0, :]
+        if not pivot.empty:
+            plt.figure(figsize=(12, max(4, 0.35 * len(pivot.index))))
+            sns.heatmap(pivot, cmap="YlGnBu", linewidths=0.3, linecolor="white")
+            plt.title("Pipeline: Tactic Categories × Primary Types", fontsize=14)
+            plt.xlabel("Primary Type")
+            plt.ylabel("Tactic Category")
+            plt.tight_layout()
+            out = os.path.join(output_dir, "pipeline_step6_2_tactic_categories_heatmap.png")
+            plt.savefig(out, dpi=200, bbox_inches="tight")
+            plt.close()
+
+    # step6-3: script_pattern 步数分布
+    if (not df_scripts.empty) and ("script_pattern" in df_scripts.columns):
+        steps = df_scripts["script_pattern"].apply(lambda v: len(_parse_json_list_maybe(v)))
+        steps = steps[steps > 0]
+        if len(steps) > 0:
+            plt.figure(figsize=(8, 4))
+            sns.countplot(x=steps, palette="Set2")
+            plt.title("Pipeline: Script Pattern Step Count", fontsize=14)
+            plt.xlabel("Number of steps")
+            plt.ylabel("Cases")
+            plt.tight_layout()
+            out = os.path.join(output_dir, "pipeline_step6_3_script_step_count.png")
+            plt.savefig(out, dpi=200, bbox_inches="tight")
+            plt.close()
+
+
+def _pipeline_forecast(*, extracted_xlsx: str, output_dir: str, horizon_days: int = 7) -> None:
+    """
+    pipeline 专用预测：基于抽取阶段的 publish_time 构建日序列，做最后N天测试 + 未来N天预测。
+    优先 ARIMA；若安装了 keras/tensorflow，则同时输出 LSTM（可选）。
+    """
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from math import sqrt
+
+    _set_cn_font_for_matplotlib()
+
+    df = pd.read_excel(extracted_xlsx)
+    if "publish_time" not in df.columns:
+        raise KeyError("预测需要 extracted 数据包含 publish_time 列。")
+
+    if "is_scam" in df.columns:
+        df = df[df["is_scam"] == True].copy()
+
+    df["publish_time"] = pd.to_datetime(df["publish_time"], errors="coerce")
+    df = df.dropna(subset=["publish_time"])
+    df["date"] = df["publish_time"].dt.date
+    if df.empty:
+        raise ValueError("预测阶段没有有效 publish_time 数据。")
+
+    start = pd.to_datetime(min(df["date"]))
+    end = pd.to_datetime(max(df["date"]))
+    idx = pd.date_range(start=start, end=end, freq="D")
+    daily = df.groupby("date").size()
+    daily.index = pd.to_datetime(daily.index)
+    daily = daily.reindex(idx, fill_value=0)
+    daily_smooth = daily.rolling(window=7, min_periods=1).mean()
+
+    def direction_accuracy(actual, pred) -> float:
+        if len(actual) < 2 or len(pred) < 2:
+            return 0.0
+        actual_dir = np.sign(np.diff(actual))
+        pred_dir = np.sign(np.diff(pred))
+        return float(np.mean(actual_dir == pred_dir))
+
+    try:
+        from statsmodels.tsa.arima.model import ARIMA
+        from sklearn.metrics import mean_squared_error
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            f"预测需要 statsmodels 与 scikit-learn：{e}\n"
+            "请安装：python -m pip install statsmodels scikit-learn"
+        ) from e
+
+    test_size = min(horizon_days, max(1, len(daily_smooth) // 5))
+    train = daily_smooth[:-test_size]
+    test = daily_smooth[-test_size:]
+
+    order = (1, 1, 1)
+    history = list(train.astype(float).values)
+    arima_pred = []
+    for t in range(len(test)):
+        fit = ARIMA(history, order=order).fit()
+        yhat = float(fit.forecast()[0])
+        arima_pred.append(yhat)
+        history.append(float(test.iloc[t]))
+    arima_pred = np.array(arima_pred)
+    actual = test.astype(float).values
+    rmse_arima = sqrt(mean_squared_error(actual, arima_pred))
+    dir_arima = direction_accuracy(actual, arima_pred)
+
+    lstm_pred = None
+    rmse_lstm = None
+    dir_lstm = None
+    try:
+        from keras.models import Sequential
+        from keras.layers import LSTM, Dense, Dropout
+        from keras.callbacks import EarlyStopping
+        from sklearn.preprocessing import MinMaxScaler
+
+        series = daily_smooth.astype(float).values.reshape(-1, 1)
+        scaler = MinMaxScaler()
+        scaled = scaler.fit_transform(series)
+        window = 7
+        X, y = [], []
+        for i in range(len(scaled) - window - test_size):
+            X.append(scaled[i : i + window])
+            y.append(scaled[i + window])
+        X = np.array(X).reshape(-1, window, 1)
+        y = np.array(y)
+        if len(X) > 0:
+            m = Sequential()
+            m.add(LSTM(20, input_shape=(window, 1)))
+            m.add(Dropout(0.2))
+            m.add(Dense(1))
+            m.compile(optimizer="adam", loss="mse")
+            m.fit(
+                X,
+                y,
+                epochs=20,
+                batch_size=8,
+                verbose=0,
+                callbacks=[EarlyStopping(monitor="loss", patience=5, restore_best_weights=True)],
+            )
+            preds = []
+            cur = scaled[len(scaled) - test_size - window : len(scaled) - test_size].reshape(1, window, 1)
+            for i in range(test_size):
+                p = m.predict(cur, verbose=0)[0, 0]
+                preds.append(p)
+                nxt_real = scaled[len(scaled) - test_size + i, 0]
+                cur = np.append(cur[:, 1:, :], np.array([[[nxt_real]]]), axis=1)
+            lstm_pred = scaler.inverse_transform(np.array(preds).reshape(-1, 1)).flatten()
+            rmse_lstm = sqrt(mean_squared_error(actual, lstm_pred))
+            dir_lstm = direction_accuracy(actual, lstm_pred)
+    except ModuleNotFoundError:
+        pass
+
+    dates = daily_smooth.index[-test_size:]
+    plt.figure(figsize=(12, 4))
+    plt.plot(dates, actual, "k-o", label="Actual (7d MA)", linewidth=2)
+    plt.plot(dates, arima_pred, "r--s", label="ARIMA")
+    if lstm_pred is not None:
+        plt.plot(dates, lstm_pred, "g--^", label="LSTM")
+    plt.title("Pipeline Forecast: Last-N Days Test (Smoothed)")
+    plt.xlabel("Date")
+    plt.ylabel("Volume")
+    plt.legend()
+    plt.grid(True)
+    out_png = os.path.join(output_dir, "pipeline_step7_1_forecast_test.png")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200, bbox_inches="tight")
+    plt.close()
+
+    future_idx = pd.date_range(start=daily_smooth.index[-1] + pd.Timedelta(days=1), periods=horizon_days, freq="D")
+    fit_full = ARIMA(list(daily_smooth.astype(float).values), order=order).fit()
+    future_arima = fit_full.forecast(steps=horizon_days)
+
+    out_txt = os.path.join(output_dir, "pipeline_step7_results.txt")
+    with open(out_txt, "w", encoding="utf-8") as f:
+        f.write("Pipeline 预测结果（基于抽取数据 publish_time 的日序列，7日移动平均）\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"ARIMA RMSE: {rmse_arima:.2f}\n")
+        f.write(f"ARIMA 方向准确率: {dir_arima*100:.1f}%\n")
+        if lstm_pred is not None and rmse_lstm is not None and dir_lstm is not None:
+            f.write(f"LSTM RMSE: {rmse_lstm:.2f}\n")
+            f.write(f"LSTM 方向准确率: {dir_lstm*100:.1f}%\n")
+        else:
+            f.write("LSTM: 未运行（未安装 keras/tensorflow 或数据不足）\n")
+        f.write("\n未来预测（ARIMA）：\n")
+        for d, v in zip(future_idx, future_arima):
+            f.write(f"  {d.date()}: {float(v):.2f}\n")
+
+
+def pipeline(
+    *,
+    project_dir: str,
+    month: str,
+    api_key: Optional[str],
+    base_url: Optional[str],
+    model: str,
+    output_dir: Optional[str] = None,
+    run_viz: bool = True,
+    run_forecast: bool = True,
+) -> None:
+    """
+    端到端流水线：抽取合并 → 打标签 → 可视化 → 预测
+    （整合自两个 notebook：`5508 案件抽取&合并.ipynb` 与 `涉诈数据打标签（scam types，tactics & script）.ipynb`）
+    """
+    import time
+    import json
+    import ast
+    from collections import Counter
+
+    import pandas as pd
+
+    project_dir = os.path.abspath(project_dir)
+    output_dir = os.path.abspath(output_dir or os.path.join(project_dir, f"pipeline_out_{month}"))
+    os.makedirs(output_dir, exist_ok=True)
+
+    client = _get_openai_client(api_key, base_url)
+
+    # step1: 新闻案件信息抽取（从原始新闻 excel → extracted excel）
+    raw_news_path = os.path.join(project_dir, "data_2025_full", "news", f"news_2025_{month}.xlsx")
+    _require_path_exists(raw_news_path, "step1 原始新闻文件")
+    news_df = pd.read_excel(raw_news_path)
+
+    def find_column(df, candidates):
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    content_col = find_column(news_df, ["content", "text", "body"])
+    title_col = find_column(news_df, ["title", "headline"])
+    source_col = find_column(news_df, ["source_publication", "source"])
+    url_col = find_column(news_df, ["url", "link"])
+    time_col = find_column(news_df, ["publish_date", "publish_time", "date"])
+
+    prompt_extract = """
+你是一个诈骗案件信息抽取系统。
+请从文本中提取结构化信息，并严格输出JSON。
+
+========================
+【诈骗判断】
+只有涉及骗钱/诈骗/诈骗集团等行为才为 true，否则 false
+
+========================
+【时间提取规则】
+尽量提取时间（支持模糊时间）：
+- 去年 → 2024
+- 今年 → 2025
+- 去年五月 → 2024-05
+- 去年五月至年底 → 2024-05~2024-12
+若无则填 null
+
+========================
+【字段规则】
+- location / country / scammer / victim_group / platform 必须是 list
+- tactic_tags 必须是短标签（2–6字）
+- scam_type 必须属于：
+  情感诈骗 / 投资诈骗 / 冒充诈骗 / 金融诈骗 / AI诈骗 / 广告诈骗 / 其他
+
+========================
+【summary规则】
+生成 40–80字结构化摘要，必须包含：
+主体 + 平台 + 手法 + 结果
+
+========================
+【输出格式】
+{
+  "is_scam": false,
+  "time": null,
+  "location": [],
+  "country": [],
+  "scammer": [],
+  "victim_group": [],
+  "platform": [],
+  "scam_type": null,
+  "tactic_tags": [],
+  "amount": null,
+  "police_involved": false,
+  "bank_involved": false,
+  "summary": ""
+}
+"""
+
+    expected_keys = [
+        "is_scam",
+        "time",
+        "location",
+        "country",
+        "scammer",
+        "victim_group",
+        "platform",
+        "scam_type",
+        "tactic_tags",
+        "amount",
+        "police_involved",
+        "bank_involved",
+        "summary",
+    ]
+
+    def fix_fields(data: dict) -> dict:
+        list_keys = {"location", "country", "scammer", "victim_group", "platform", "tactic_tags"}
+        for k in expected_keys:
+            if k not in data:
+                data[k] = [] if k in list_keys else None
+        return data
+
+    def to_bool(x) -> bool:
+        return str(x).lower() in ["true", "1"]
+
+    def postprocess(data: dict) -> dict:
+        data["is_scam"] = to_bool(data.get("is_scam"))
+        data["police_involved"] = to_bool(data.get("police_involved"))
+        data["bank_involved"] = to_bool(data.get("bank_involved"))
+        for key in ["location", "country", "scammer", "victim_group", "platform", "tactic_tags"]:
+            if not isinstance(data.get(key), list):
+                data[key] = [data[key]] if data.get(key) else []
+        return data
+
+    def extract_case_info(text: str) -> Optional[dict]:
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": prompt_extract},
+                    {"role": "user", "content": str(text)[:3000]},
+                ],
+                temperature=0.2,
+            )
+            content = resp.choices[0].message.content or ""
+            data = _clean_json_maybe(content)
+            if not isinstance(data, dict):
+                return None
+            data = postprocess(fix_fields(data))
+            return data
+        except Exception:
+            return None
+
+    extracted_path = os.path.join(output_dir, f"news_2025_{month}_extracted.xlsx")
+    results = []
+    start_idx = 0
+    if os.path.exists(extracted_path):
+        old = pd.read_excel(extracted_path)
+        results = old.to_dict("records")
+        start_idx = len(results)
+
+    total = len(news_df)
+    for i in range(start_idx, total):
+        row = news_df.iloc[i]
+        content = row[content_col] if content_col else ""
+        title = row[title_col] if title_col else ""
+        source = row[source_col] if source_col else ""
+        url = row[url_col] if url_col else ""
+        publish_time = row[time_col] if time_col else None
+        full_text = f"{title}\n{content}"
+        res = extract_case_info(full_text)
+        if res:
+            res.update(
+                {
+                    "title": title,
+                    "content": content,
+                    "source_publication": source,
+                    "url": url,
+                    "publish_time": str(publish_time),
+                }
+            )
+            results.append(res)
+        if i % 20 == 0:
+            pd.DataFrame(results).to_excel(extracted_path, index=False)
+        time.sleep(0.3)
+    pd.DataFrame(results).to_excel(extracted_path, index=False)
+
+    # step2: 新闻案件合并（按 case_key 聚类 + LLM 生成 title/summary）
+    df_ex = pd.read_excel(extracted_path)
+    df_ex = df_ex[df_ex["is_scam"] == True].copy()
+    df_ex.reset_index(drop=True, inplace=True)
+
+    def safe_list(x):
+        if isinstance(x, list):
+            return x
+        if pd.isna(x) or x == "":
+            return []
+        if isinstance(x, str) and x.startswith("["):
+            try:
+                return ast.literal_eval(x)
+            except Exception:
+                return []
+        return [x]
+
+    for col in ["location", "scammer", "platform", "tactic_tags"]:
+        if col in df_ex.columns:
+            df_ex[col] = df_ex[col].apply(safe_list)
+        else:
+            df_ex[col] = [[] for _ in range(len(df_ex))]
+
+    df_ex["summary"] = df_ex.get("summary", "").fillna("")
+    df_ex["content"] = df_ex.get("content", "").fillna("")
+    df_ex["time"] = df_ex.get("time", "").astype(str).str[:7]
+
+    def normalize(x):
+        return str(x).replace("（", "").replace("）", "").strip().lower()
+
+    def get_case_key(row):
+        scammers = sorted(set([normalize(s) for s in row["scammer"] if s]))
+        scam_type = normalize(row.get("scam_type"))
+        time_key = row.get("time")
+        if scammers:
+            return "_".join(scammers) + "_" + scam_type + "_" + time_key
+        return scam_type + "_" + time_key + "_" + (row.get("summary", "")[:20])
+
+    df_ex["case_key"] = df_ex.apply(get_case_key, axis=1)
+    clusters = [list(g.index) for _, g in df_ex.groupby("case_key")]
+
+    import re
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def clean_output(text, max_len=18):
+        if not text:
+            return ""
+        text = text.strip().replace("\n", "")
+        for bp in ["以下是", "标题：", "答案：", "生成标题", "可以是"]:
+            if text.startswith(bp):
+                text = text[len(bp) :]
+        text = re.split(r"[。！？\n]", text)[0]
+        return text[:max_len]
+
+    def generate_summary(summaries):
+        summaries = [s for s in summaries if isinstance(s, str) and len(s) > 10]
+        if len(summaries) <= 2:
+            return "；".join(summaries[:2])
+        text = "\n".join(summaries[:5])
+        prompt = f"""请整合以下诈骗摘要，生成一个80字以内案件描述。
+【强制要求】
+- 必须包含：主体 + 手法 + 结果
+- 必须是一句话
+- 不要分点
+- 不要解释
+- 不要输出多句
+- 不要出现“该案件”“本案”等废话
+【输入】
+{text}
+【输出】
+"""
+        try:
+            resp = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], temperature=0.2)
+            return clean_output(resp.choices[0].message.content or "", 80)
+        except Exception:
+            return summaries[0] if summaries else ""
+
+    def generate_title(summary):
+        prompt = f"""你是一名新闻编辑，请将以下诈骗案件摘要压缩为一个新闻标题。
+【标题结构（必须遵守）】
+优先：
+1. 地点/主体 + 手法 + 结果
+2. 主体 + 行为 + 结果
+3. 手法 + 案件 + 结果
+【强制要求】
+- 只能输出一个标题
+- 不要解释
+- 不要换行
+- 不要多个选项
+- 字数：10-15字（最多18字）
+- 必须包含具体信息（人物/地点/平台/手法）
+【摘要】
+{summary}
+【输出】
+"""
+        try:
+            resp = client.chat.completions.create(model=model, messages=[{"role": "user", "content": prompt}], temperature=0.2)
+            return clean_output(resp.choices[0].message.content or "", 18)
+        except Exception:
+            return summary[:15]
+
+    merged_path = os.path.join(output_dir, f"scam_cases_final_2025_{month}.xlsx")
+    cases = []
+    done_ids = set()
+    if os.path.exists(merged_path):
+        old = pd.read_excel(merged_path)
+        cases = old.to_dict("records")
+        if "case_id" in old.columns:
+            done_ids = set(old["case_id"].astype(str))
+
+    def process_case(idx, cluster):
+        sub = df_ex.loc[cluster]
+        summaries = sub["summary"].tolist()
+        contents = sub["content"].tolist()
+        urls = sub["url"].tolist() if "url" in sub.columns else []
+        scammers = sum(sub["scammer"], [])
+        case_summary = summaries[0] if len(sub) == 1 else generate_summary(summaries)
+        case_title = generate_title(case_summary)
+        tags = sum(sub["tactic_tags"], [])
+        top_tags = [k for k, _ in Counter(tags).most_common(6)]
+        return {
+            "case_id": f"CASE_{idx+1}",
+            "case_title": case_title,
+            "case_summary": case_summary,
+            "time_range": f"{sub['time'].min()} ~ {sub['time'].max()}",
+            "location": list(set(sum(sub["location"], []))),
+            "platform": list(set(sum(sub["platform"], []))),
+            "scam_type": sub["scam_type"].mode()[0] if "scam_type" in sub.columns and not sub["scam_type"].mode().empty else None,
+            "tactic_tags": top_tags,
+            "amount": sub["amount"].max() if "amount" in sub.columns else None,
+            "police_involved": bool(sub["police_involved"].any()) if "police_involved" in sub.columns else False,
+            "scammers": list(set(scammers)),
+            "contents": contents,
+            "urls": urls,
+            "source_count": int(len(sub)),
+        }
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {}
+        for idx, cluster in enumerate(clusters):
+            cid = f"CASE_{idx+1}"
+            if cid in done_ids:
+                continue
+            futures[executor.submit(process_case, idx, cluster)] = idx
+        done = 0
+        for future in as_completed(futures):
+            case = future.result()
+            cases.append(case)
+            done += 1
+            if done % 10 == 0:
+                pd.DataFrame(cases).to_excel(merged_path, index=False)
+    pd.DataFrame(cases).to_excel(merged_path, index=False)
+
+    # step3: Scam types 打标签（posts / news cases / social patterns）
+    # 说明：这一步整合自 notebook，但不再硬编码 key/base_url；全部从参数/环境变量读取
+    # 这里默认只对 step2 的合并案件进行 types 打标，便于后续可视化/预测
+    df_cases = pd.read_excel(merged_path)
+    out_types_path = os.path.join(output_dir, "news_scam_types.xlsx")
+
+    def build_prompt_type(text: str) -> str:
+        return f"""你是一个诈骗案件分类系统，请根据案件摘要进行诈骗类型标注。
+输出 JSON：
+{{"primary_scam_type":"", "secondary_scam_types":[], "scam_process":""}}
+诈骗类型定义：
+- Financial Scam（资金诈骗）：直接涉及资金转移（投资、转账、骗钱）
+- Market Scam（交易诈骗）：通过虚假商品或服务交易诈骗
+- Identity-based Scam（身份冒充诈骗）：冒充机构/公司/政府获取信任
+- Relationship-based Scam（关系诈骗）：利用情感或熟人关系诈骗
+- System Scam（系统漏洞诈骗）：利用制度、平台或规则漏洞
+判定优先：有交易→Market；有直接骗钱→Financial；有冒充→Identity。
+要求：scam_process 20–40字，一句话，描述过程不解释。
+案件摘要：{text}"""
+
+    def classify_type(text: str) -> Optional[dict]:
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": build_prompt_type(str(text)[:1000])}],
+                temperature=0.2,
+            )
+            data = _clean_json_maybe(resp.choices[0].message.content or "")
+            if not isinstance(data, dict):
+                return None
+            return {
+                "primary_type": data.get("primary_scam_type"),
+                "secondary_types": data.get("secondary_scam_types"),
+                "scam_process": data.get("scam_process"),
+            }
+        except Exception:
+            return None
+
+    type_results = []
+    start_idx = 0
+    if os.path.exists(out_types_path):
+        old = pd.read_excel(out_types_path)
+        type_results = old.to_dict("records")
+        start_idx = len(type_results)
+    for i in range(start_idx, len(df_cases)):
+        row = df_cases.iloc[i]
+        text = row.get("case_summary", "")
+        res = classify_type(text)
+        if res:
+            new_row = row.to_dict()
+            new_row.update(
+                {
+                    "primary_type": res["primary_type"],
+                    "secondary_types": json.dumps(res["secondary_types"], ensure_ascii=False),
+                    "scam_process": res["scam_process"],
+                }
+            )
+            type_results.append(new_row)
+        if i % 20 == 0:
+            pd.DataFrame(type_results).to_excel(out_types_path, index=False)
+        time.sleep(0.2)
+    pd.DataFrame(type_results).to_excel(out_types_path, index=False)
+
+    # step4: Scam tactics 打标签（输出 tactic_categories / tactic_tags）
+    out_tactics_path = os.path.join(output_dir, "news_tactic_categories_ai.xlsx")
+    df_in = pd.read_excel(out_types_path)
+
+    def build_prompt_tactic(text: str) -> str:
+        return f"""你是一个诈骗机制分析系统，请根据案件摘要判断诈骗所使用的核心手法类别（tactic categories）。
+输出 JSON：{{"tactic_categories":[]}}
+Tactic Categories 定义：
+- Deception（信息欺骗）：提供虚假信息（假商品、假通知、伪造文件等）
+- Trust Building（信任建立）：通过身份或关系建立可信度（冒充、权威、熟人）
+- Manipulation（心理操控）：利用情绪或心理压力（紧急、恐吓、诱导）
+- Execution（执行机制）：实施路径（转账、支付、联系、平台跳转）
+- Concealment（掩盖行为）：隐藏身份/规避追查（多账户、匿名、跨平台）
+规则：可多选（1–4个），关注“如何实现”而非表面内容。
+案件摘要：{text}"""
+
+    def classify_tactic(text: str) -> Optional[list]:
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": build_prompt_tactic(str(text)[:1000])}],
+                temperature=0.2,
+            )
+            data = _clean_json_maybe(resp.choices[0].message.content or "")
+            if isinstance(data, dict):
+                return data.get("tactic_categories", [])
+            return None
+        except Exception:
+            return None
+
+    tactic_results = []
+    start_idx = 0
+    if os.path.exists(out_tactics_path):
+        old = pd.read_excel(out_tactics_path)
+        tactic_results = old.to_dict("records")
+        start_idx = len(tactic_results)
+    for i in range(start_idx, len(df_in)):
+        row = df_in.iloc[i]
+        text = row.get("case_summary", "")
+        res = classify_tactic(text)
+        if res is not None:
+            new_row = row.to_dict()
+            new_row["tactic_categories"] = json.dumps(res, ensure_ascii=False)
+            tactic_results.append(new_row)
+        if i % 20 == 0:
+            pd.DataFrame(tactic_results).to_excel(out_tactics_path, index=False)
+        time.sleep(0.2)
+    df_out = pd.DataFrame(tactic_results)
+    # 保持与 notebook 一致的列顺序：把 tactic_categories 插到 tactic_tags 之前（若存在）
+    cols = list(df_out.columns)
+    if "tactic_tags" in cols and "tactic_categories" in cols:
+        idx = cols.index("tactic_tags")
+        cols.insert(idx, cols.pop(cols.index("tactic_categories")))
+        df_out = df_out[cols]
+    df_out.to_excel(out_tactics_path, index=False)
+
+    # step5: script_pattern 抽取（新闻：基于 contents + summary 还原流程）
+    out_scripts_path = os.path.join(output_dir, "news_with_scripts.xlsx")
+    df_cases2 = pd.read_excel(out_tactics_path)
+
+    def clean_contents(raw):
+        try:
+            if isinstance(raw, str):
+                raw = ast.literal_eval(raw)
+            texts = []
+            for item in raw:
+                item = str(item).split("|")[0]
+                texts.append(item.strip())
+            return " ".join(texts)
+        except Exception:
+            return str(raw)
+
+    def build_prompt_script_news(content_text: str, summary_text: str) -> str:
+        return f"""你是一个诈骗话术分析系统，请根据新闻案件描述重建诈骗流程（script pattern）。
+任务：抽取诈骗步骤（3–6步）
+要求：
+1 每一步是“诈骗者的行为”
+2 使用抽象表达（不要复述原文）
+3 每步一句话（10–20字），动词开头
+4 保持逻辑顺序
+优先级：优先 contents，不足用 summary 补充
+输出 JSON：{{"script_pattern":[]}}
+新闻内容：{content_text}
+摘要补充：{summary_text}"""
+
+    def extract_script_news(content: str, summary: str) -> Optional[list]:
+        try:
+            prompt = build_prompt_script_news(content[:1500], summary[:500])
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            data = _clean_json_maybe(resp.choices[0].message.content or "")
+            if isinstance(data, dict):
+                return data.get("script_pattern", [])
+            return None
+        except Exception:
+            return None
+
+    script_results = []
+    start_idx = 0
+    if os.path.exists(out_scripts_path):
+        old = pd.read_excel(out_scripts_path)
+        script_results = old.to_dict("records")
+        start_idx = len(script_results)
+    for i in range(start_idx, len(df_cases2)):
+        row = df_cases2.iloc[i]
+        content_raw = row.get("contents", "")
+        summary = row.get("case_summary", "")
+        content_clean = clean_contents(content_raw)
+        script = extract_script_news(content_clean, summary)
+        if script:
+            new_row = row.to_dict()
+            new_row["script_pattern"] = json.dumps(script, ensure_ascii=False)
+            script_results.append(new_row)
+        if i % 20 == 0:
+            pd.DataFrame(script_results).to_excel(out_scripts_path, index=False)
+        time.sleep(0.2)
+    pd.DataFrame(script_results).to_excel(out_scripts_path, index=False)
+
+    # step6: 可视化（pipeline 专用：直接使用 step3/4/5 的输出，不依赖旧脚本文件命名）
+    if run_viz:
+        _pipeline_viz(
+            types_xlsx=out_types_path,
+            tactics_xlsx=out_tactics_path,
+            scripts_xlsx=out_scripts_path,
+            output_dir=output_dir,
+        )
+
+    # step7: 预测（pipeline 专用：基于 step1 extracted 的 publish_time 日序列）
+    if run_forecast:
+        _pipeline_forecast(extracted_xlsx=extracted_path, output_dir=output_dir, horizon_days=7)
+
+    print("\n✅ pipeline 完成。关键输出：")
+    print(f" - step1 extracted: {extracted_path}")
+    print(f" - step2 merged: {merged_path}")
+    print(f" - step3 types: {out_types_path}")
+    print(f" - step4 tactics: {out_tactics_path}")
+    print(f" - step5 scripts: {out_scripts_path}")
+    if run_viz:
+        print(" - step6 viz outputs: pipeline_step6_*.png")
+    if run_forecast:
+        print(" - step7 forecast outputs: pipeline_step7_*.png/.txt")
 
 
 def _set_cn_font_for_matplotlib() -> None:
@@ -1800,6 +2628,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", default=_auto_detect_trend_data_dir(), help="trend 输入数据目录（包含 news_2025_10_extracted 等）")
     p.add_argument("--output-dir", default=_script_dir(), help="输出目录（默认当前目录）")
     p.set_defaults(_run=lambda args: trend(args.data_dir, output_dir=args.output_dir))
+
+    p = sub.add_parser("pipeline", help="端到端：抽取合并→打标签→可视化→预测（按 step1..stepN）")
+    p.add_argument("--project-dir", default=_script_dir(), help="项目根目录（包含 data_2025_full/）")
+    p.add_argument("--month", default="12", help="月份：10/11/12（用于读取 news_2025_{month}.xlsx 等）")
+    p.add_argument("--api-key", default=None, help="LLM API key（默认读环境变量 OPENAI_API_KEY）")
+    p.add_argument("--base-url", default=None, help="OpenAI-compatible base_url（默认读环境变量 OPENAI_BASE_URL）")
+    p.add_argument("--model", default=_get_env("OPENAI_MODEL") or "deepseek-chat", help="模型名（默认 deepseek-chat 或 OPENAI_MODEL）")
+    p.add_argument("--output-dir", default=None, help="输出目录（默认 project_dir/pipeline_out_{month}）")
+    p.add_argument("--no-viz", action="store_true", help="不运行 step6 可视化")
+    p.add_argument("--no-forecast", action="store_true", help="不运行 step7 预测")
+    p.set_defaults(
+        _run=lambda args: pipeline(
+            project_dir=args.project_dir,
+            month=str(args.month).zfill(2),
+            api_key=args.api_key,
+            base_url=args.base_url,
+            model=args.model,
+            output_dir=args.output_dir,
+            run_viz=not args.no_viz,
+            run_forecast=not args.no_forecast,
+        )
+    )
 
     return parser
 
