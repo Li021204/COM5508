@@ -31,11 +31,11 @@ python "代码整合版.py" pipeline --month 12 --project-dir .
 
 - **step1**：新闻案件信息抽取 → `news_2025_{month}_extracted.xlsx`
 - **step2**：按 `case_key` 聚类合并案件 → `scam_cases_final_2025_{month}.xlsx`
-- **step3**：Scam types 打标（primary/secondary + scam_process）→ `news_scam_types.xlsx`
-- **step4**：Scam tactics 打标（tactic_categories）→ `news_tactic_categories_ai.xlsx`
-- **step5**：script_pattern 抽取（3–6步流程）→ `news_with_scripts.xlsx`
-- **step6**：pipeline 专用可视化（不依赖旧脚本命名）→ `pipeline_step6_*.png`
-- **step7**：pipeline 专用预测（基于 publish_time 构建日序列，ARIMA；可选 LSTM）→ `pipeline_step7_*.png` + `pipeline_step7_results.txt`
+- **step3**：Scam types 打标签（primary/secondary + scam_process）→ `news_scam_types.xlsx`
+- **step4**：Scam tactics 打标签（tactic_categories）→ `news_tactic_categories_ai.xlsx`
+- **step5**：script_pattern 打标签（3–6步流程）→ `news_with_scripts.xlsx`
+- **step6**：可视化→ `pipeline_step6_*.png`
+- **step7**：趋势预测（基于 publish_time 构建日序列，ARIMA；可选 LSTM）→ `pipeline_step7_*.png` + `pipeline_step7_results.txt`
 ---
 
 ## 依赖安装（推荐）
